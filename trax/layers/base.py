@@ -32,8 +32,11 @@ from trax.shapes import ShapeDtype
 from trax.shapes import signature
 
 
-EMPTY_WEIGHTS = ()
-EMPTY_STATE = ()
+# TODO(lukaszkaiser): distinguish the 2 kinds below and add more tests.
+EMPTY_WEIGHTS = ()    # Used for layers that have no trainable weights.
+EMPTY_STATE = ()      # Used for layers that have no non-trainable state.
+GET_WEIGHTS_FROM_CACHE = ()  # Used to mark that the weights are shared.
+GET_STATE_FROM_CACHE = ()    # Used to mark that the state is shared.
 
 
 class Layer(object):
@@ -107,6 +110,7 @@ class Layer(object):
     self._caller = {'filename': copy.copy(frame.f_code.co_filename),
                     'lineno': int(frame.f_lineno)}
     del frame  # Just in case.
+    self._init_finished = False
     self._jit_cache = {}
 
   def __repr__(self):
@@ -238,21 +242,18 @@ class Layer(object):
     del input_signature
     return EMPTY_WEIGHTS
 
-  def new_weights_and_state(self, input_signature, initialized_layers=None):
+  def new_weights_and_state(self, input_signature):
     """Returns a (weights, state) pair suitable for initializing this layer.
 
     Authors of new Layer subclasses should override this method if their layer
-    has non-parameter state that gets updated between batches. The default
-    implementation works for layers that have no state.
+    uses trainable weights or has non-parameter state that gets updated
+    between batches. The default implementation works for layers that have
+    no weights or state.
 
     Args:
       input_signature: A ShapeDtype instance (if this layer takes one input)
           or a list/tuple of ShapeDtype instances.
-      initialized_layers: Unless you are writing a combinator that manages layer
-        trees, ignore this. Optional list of already initialized layers, used
-        to control weights of shared layer instances in combinators.
     """
-    del initialized_layers
     return self.new_weights(input_signature), EMPTY_STATE
 
   @property
@@ -287,7 +288,7 @@ class Layer(object):
   # End of public subclassing interface.
   # Begin public callable interface.
 
-  def init(self, input_signature, rng=None, initialized_layers=None):
+  def init(self, input_signature, rng=None, cache=False):
     """Initializes this layer and its sublayers recursively.
 
     This method is designed to initialize each layer instance once, even if the
@@ -299,31 +300,26 @@ class Layer(object):
           or list/tuple of `ShapeDtype` instances.
       rng: Single-use random number generator (JAX PRNG key). If none is
           provided, a default rng based on the integer seed 0 will be used.
-      initialized_layers: Optional list of already initialized layers, used
-        to control weights of shared layer instances; if current layer is on
-        this list, this function will return EMPTY_WEIGHTS as weights.
+      cache: if True, returns (GET_WEIGHTS_FROM_CACHE, GET_STATE_FROM_CACHE)
+          if this layer has already been initialized; used to implement shared
+          layers in combinators.
 
     Returns:
-      A (weights, state) tuple.
+      A (weights, state) tuple, in which weights contains newly created weights
+          on the first call and `EMPTY_WEIGHTS` on all subsequent calls.
     """
     try:
+      if self._init_finished and cache:
+        return (GET_WEIGHTS_FROM_CACHE, GET_STATE_FROM_CACHE)
+
       if rng is not None:
         self.rng = rng
-      # Initialize weights once; store them for use when this layer is called.
-      # Needs to call new_weights_and_state regardless of _init_finished because
-      # state also needs to be initialized. After jitting, graph pruning should
-      # be able to remove unnecessary computation.
-      # TODO(lukaszkaiser): Revisit this decision and see whether layers sharing
-      #   weights should also share states.
-      weights, state = self.new_weights_and_state(
-          input_signature, initialized_layers=initialized_layers)
-      if initialized_layers is not None and id(self) in initialized_layers:
-        return (EMPTY_WEIGHTS, state)
-
+      weights, state = self.new_weights_and_state(input_signature)
+      self._init_finished = True
       self._weights = weights
       self._state = state
-      if initialized_layers is not None:
-        initialized_layers.append(id(self))
+      if not cache:
+        self._clear_init_finished()
       return (weights, state)
 
     except Exception as e:
@@ -408,7 +404,12 @@ class Layer(object):
       for sublayer, rng in zip(sublayers, rngs):
         sublayer.rng = rng
 
-  def pure_fn(self, x, weights, state, rng):
+  def _clear_init_finished(self):
+    self._init_finished = False
+    for sublayer in self.sublayers:
+      sublayer._clear_init_finished()  # pylint: disable=protected-access
+
+  def pure_fn(self, x, weights, state, rng, cache=False):
     """Applies this layer as a pure function with no optional args.
 
     This method exposes the layer's computation as a pure function. This is
@@ -419,28 +420,29 @@ class Layer(object):
       weights: See Layer.forward_with_state.
       state: See Layer.forward_with_state.
       rng: See Layer.forward_with_state.
+      cache: if True, cache weights and state in the layer object; used
+        to implement layer sharing in combinators.
 
     Returns:
       See Layer.forward_with_state.
     """
     try:
-      # If weights are nothing, we may be reusing this layer.
-      # Use the cached weights to calculate the value.
-      # Note: to make sure jit tracers can decide this branch in python we use
-      # `weights is EMPTY_WEIGHTS` instead of, e.g., `not weights` or
-      # `weights == EMPTY_WEIGHTS`.
-      if weights is EMPTY_WEIGHTS:  # pylint: disable=literal-comparison
+      old_weights, old_state = self.weights, self.state
+      if weights is GET_WEIGHTS_FROM_CACHE:  # pylint: disable=literal-comparison
         weights = self._weights
+        state = self._state
       else:
         # In this case, we're called for the first time: cache weights.
         self._weights = weights
 
       if not self.has_backward:
-        outputs, s = (
-            self.forward_with_state(x, weights, state, rng))
+        outputs, s = self.forward_with_state(x, weights, state, rng)
       else:
         outputs, s = self._do_custom_gradients(x, weights, state, rng=rng)
       self._state = s
+      if not cache:
+        self.weights = old_weights
+        self.state = old_state
       return outputs, s
 
     except Exception as e:
@@ -472,7 +474,7 @@ class Layer(object):
       # TODO(jonni): Check if using an rng still carries this cost.
       rng_signature = ShapeDtype((2,), np.uint32)
       weight_signature = nested_map(signature, self.weights)
-      forward_infer_shapes = math.abstract_eval(self.forward_with_state)
+      forward_infer_shapes = math.abstract_eval(self.pure_fn)
       return forward_infer_shapes(
           input_signature, weight_signature, self.state, rng_signature)
     except Exception as e:
